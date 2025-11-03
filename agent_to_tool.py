@@ -78,16 +78,244 @@ class MCPServerConnection:
     toolset: McpToolset
 
 
-class SuperAgent:
-    """Google ADK 기반 2개 MCP 서버를 관리하는 Super Agent"""
+@dataclass
+class AgentResponse:
+    """에이전트 응답 데이터 클래스"""
+    content: str
+    metadata: Dict[str, Any]
+    success: bool
+    agent_name: str
+
+
+class SpecializedAgent:
+    """특화된 에이전트 기본 클래스"""
+
+    def __init__(self, name: str, role: str, system_prompt: str, aoai_wrapper: AzureOpenAIWrapper):
+        self.name = name
+        self.role = role
+        self.system_prompt = system_prompt
+        self.aoai_wrapper = aoai_wrapper
+
+    async def process(self, user_input: str, context: Optional[Dict[str, Any]] = None) -> AgentResponse:
+        """에이전트가 입력을 처리하고 응답 반환"""
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_input}
+        ]
+
+        # 컨텍스트가 있으면 추가
+        if context:
+            context_str = f"\n\n[Context from previous agents]\n{json.dumps(context, indent=2, ensure_ascii=False)}"
+            messages[-1]["content"] += context_str
+
+        try:
+            response = self.aoai_wrapper.chat_completion(messages, stream=False)
+            content = response.choices[0].message.content or ""
+
+            return AgentResponse(
+                content=content,
+                metadata={"tokens": response.usage.total_tokens if hasattr(response, 'usage') else 0},
+                success=True,
+                agent_name=self.name
+            )
+        except ContentFilterError as e:
+            return AgentResponse(
+                content=f"콘텐츠 필터링 차단: {', '.join(e.filtered_categories)}",
+                metadata={"error": str(e)},
+                success=False,
+                agent_name=self.name
+            )
+        except Exception as e:
+            return AgentResponse(
+                content=f"에러 발생: {str(e)}",
+                metadata={"error": str(e)},
+                success=False,
+                agent_name=self.name
+            )
+
+
+class QuestionUnderstandingAgent(SpecializedAgent):
+    """Agent A: 질문 이해 담당"""
+
+    def __init__(self, aoai_wrapper: AzureOpenAIWrapper):
+        system_prompt = """당신은 질문 분석 전문가입니다.
+사용자의 질문을 분석하여 다음을 추출합니다:
+1. 핵심 키워드
+2. 질문 유형 (법률 관련, 판례 검색, 일반 질문)
+3. 필요한 후속 에이전트 (legal_agent, precedent_agent, 또는 none)
+4. 구조화된 쿼리
+
+응답은 반드시 다음 JSON 형식으로 제공하세요:
+{
+  "keywords": ["키워드1", "키워드2"],
+  "question_type": "legal|precedent|general",
+  "next_agent": "legal_agent|precedent_agent|none",
+  "structured_query": "재구성된 명확한 질문",
+  "analysis": "간단한 분석 설명"
+}"""
+        super().__init__(
+            name="QuestionUnderstandingAgent",
+            role="질문 이해 및 분석",
+            system_prompt=system_prompt,
+            aoai_wrapper=aoai_wrapper
+        )
+
+
+class LegalExpertAgent(SpecializedAgent):
+    """Agent B: 법률 전문"""
+
+    def __init__(self, aoai_wrapper: AzureOpenAIWrapper, tools: List[BaseTool]):
+        system_prompt = """당신은 법률 전문가입니다.
+법률 관련 질문에 대해 정확하고 전문적인 답변을 제공합니다.
+가능한 경우 관련 법조문, 법률 용어, 절차 등을 설명합니다.
+필요시 제공된 도구를 사용하여 정보를 검색할 수 있습니다."""
+        super().__init__(
+            name="LegalExpertAgent",
+            role="법률 전문 답변",
+            system_prompt=system_prompt,
+            aoai_wrapper=aoai_wrapper
+        )
+        self.tools = tools
+
+    async def process_with_tools(self, user_input: str, context: Optional[Dict[str, Any]] = None) -> AgentResponse:
+        """도구를 사용하여 처리"""
+        tools_for_openai = []
+        for tool in self.tools:
+            tool_name = getattr(tool, 'name', type(tool).__name__)
+            tool_description = getattr(tool, 'description', '')
+            tool_input_schema = getattr(tool, 'input_schema', None) or {"type": "object", "properties": {}}
+            tools_for_openai.append({
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "description": tool_description or "",
+                    "parameters": tool_input_schema,
+                },
+            })
+
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_input}
+        ]
+
+        if context:
+            context_str = f"\n\n[Context]\n{json.dumps(context, indent=2, ensure_ascii=False)}"
+            messages[-1]["content"] += context_str
+
+        # 도구 호출 루프
+        max_iterations = 5
+        for iteration in range(max_iterations):
+            try:
+                response = self.aoai_wrapper.chat_completion(messages, tools=tools_for_openai, stream=False)
+                choice = response.choices[0].message
+
+                if not getattr(choice, "tool_calls", None):
+                    # 도구 호출 없음 - 최종 답변
+                    return AgentResponse(
+                        content=choice.content or "",
+                        metadata={"iterations": iteration + 1},
+                        success=True,
+                        agent_name=self.name
+                    )
+
+                # 도구 호출 처리
+                print(f"  🔧 [{self.name}] Tool calls: {len(choice.tool_calls)}", flush=True)
+                tool_results = []
+
+                for tc in choice.tool_calls:
+                    tool_name = tc.function.name
+                    args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+
+                    for tool in self.tools:
+                        current_tool_name = getattr(tool, 'name', type(tool).__name__)
+                        if current_tool_name == tool_name:
+                            try:
+                                from google.adk.models import LlmRequest
+                                class DummyToolContext:
+                                    def __init__(self):
+                                        self.llm_request = LlmRequest(contents=[])
+
+                                tool_context = DummyToolContext()
+                                result = await tool.run_async(args=args, tool_context=tool_context)
+                                tool_results.append({
+                                    "tool_call_id": tc.id,
+                                    "content": str(result),
+                                })
+                                print(f"    ✅ Tool {tool_name} executed", flush=True)
+                                break
+                            except Exception as e:
+                                tool_results.append({
+                                    "tool_call_id": tc.id,
+                                    "content": f"Error: {str(e)}",
+                                })
+                                break
+
+                messages.append({
+                    "role": "assistant",
+                    "content": choice.content or "",
+                    "tool_calls": [tc.model_dump() for tc in choice.tool_calls],
+                })
+                for tr in tool_results:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tr["tool_call_id"],
+                        "content": tr["content"],
+                    })
+
+            except Exception as e:
+                return AgentResponse(
+                    content=f"에러 발생: {str(e)}",
+                    metadata={"error": str(e), "iteration": iteration},
+                    success=False,
+                    agent_name=self.name
+                )
+
+        return AgentResponse(
+            content="최대 반복 횟수 도달",
+            metadata={"iterations": max_iterations},
+            success=False,
+            agent_name=self.name
+        )
+
+
+class PrecedentExpertAgent(SpecializedAgent):
+    """Agent C: 판례 전문"""
+
+    def __init__(self, aoai_wrapper: AzureOpenAIWrapper, tools: List[BaseTool]):
+        system_prompt = """당신은 판례 검색 및 분석 전문가입니다.
+판례 관련 질문에 대해 관련 판례를 검색하고 분석합니다.
+판례의 핵심 쟁점, 판결 요지, 적용 법리 등을 명확하게 설명합니다.
+필요시 제공된 도구를 사용하여 판례를 검색할 수 있습니다."""
+        super().__init__(
+            name="PrecedentExpertAgent",
+            role="판례 검색 및 분석",
+            system_prompt=system_prompt,
+            aoai_wrapper=aoai_wrapper
+        )
+        self.tools = tools
+
+    async def process_with_tools(self, user_input: str, context: Optional[Dict[str, Any]] = None) -> AgentResponse:
+        """도구를 사용하여 판례 검색 및 분석"""
+        # LegalExpertAgent와 동일한 로직 사용
+        agent = LegalExpertAgent(self.aoai_wrapper, self.tools)
+        agent.name = self.name
+        agent.system_prompt = self.system_prompt
+        return await agent.process_with_tools(user_input, context)
+
+
+class MultiAgentOrchestrator:
+    """멀티 에이전트 오케스트레이터 - 여러 특화 에이전트를 관리하고 조율"""
 
     def __init__(self):
         self.servers: Dict[str, MCPServerConnection] = {}
-        self.agent: Optional[Agent] = None
-        self.runner: Optional[Runner] = None
         self.all_tools: List[BaseTool] = []
-        self._closing = False  # 닫는 중 플래그
+        self._closing = False
         self.aoai_wrapper: Optional[AzureOpenAIWrapper] = None
+
+        # 특화된 에이전트들
+        self.question_agent: Optional[QuestionUnderstandingAgent] = None
+        self.legal_agent: Optional[LegalExpertAgent] = None
+        self.precedent_agent: Optional[PrecedentExpertAgent] = None
 
     @staticmethod
     def _normalize_url(url: str) -> str:
@@ -144,26 +372,30 @@ class SuperAgent:
                 del self.servers[server_name]
             raise RuntimeError(f"Failed to connect to MCP server {server_name} at {base_url}: {error_msg}") from e
 
-    def initialize_agent(self):
+    def initialize_agents(self):
+        """개별 특화 에이전트들을 초기화"""
         self.aoai_wrapper = AzureOpenAIWrapper(
             api_key=os.environ["AZURE_OPENAI_API_KEY"],
             api_version=os.environ["AZURE_OPENAI_API_VERSION"],
             azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
             deployment=os.environ["AZURE_OPENAI_DEPLOYMENT"],
         )
-        self.agent = Agent(
-            name="super_agent",
-            description="Super agent that can use tools from 2 MCP servers",
-            model="",  # 모델 호출은 직접 AOAIWrapper로
-            tools=self.all_tools,
-            instruction=(
-                "You are a super agent that can use tools from multiple MCP servers. "
-                "Use the appropriate tools from different servers to help the user."
-            ),
-        )
-        from google.adk.sessions import InMemorySessionService
-        session_service = InMemorySessionService()
-        self.runner = Runner(app_name="agents", agent=self.agent, session_service=session_service)
+
+        # Agent A: 질문 이해 담당
+        self.question_agent = QuestionUnderstandingAgent(self.aoai_wrapper)
+
+        # Agent B: 법률 전문 (MCP Server 1 도구 사용)
+        legal_tools = [tool for tool in self.all_tools if 'mcp1' in getattr(tool, 'name', '')]
+        self.legal_agent = LegalExpertAgent(self.aoai_wrapper, legal_tools if legal_tools else self.all_tools)
+
+        # Agent C: 판례 전문 (MCP Server 2 도구 사용)
+        precedent_tools = [tool for tool in self.all_tools if 'mcp2' in getattr(tool, 'name', '')]
+        self.precedent_agent = PrecedentExpertAgent(self.aoai_wrapper, precedent_tools if precedent_tools else self.all_tools)
+
+        print(f"✅ 에이전트 초기화 완료:")
+        print(f"   - {self.question_agent.name}: {self.question_agent.role}")
+        print(f"   - {self.legal_agent.name}: {self.legal_agent.role} (도구 {len(self.legal_agent.tools)}개)")
+        print(f"   - {self.precedent_agent.name}: {self.precedent_agent.role} (도구 {len(self.precedent_agent.tools)}개)")
 
     async def close_all_servers(self):
         """모든 MCP 서버 연결을 안전하게 종료"""
@@ -187,8 +419,9 @@ class SuperAgent:
         self._closing = False
 
 
-async def initialize_super_agent() -> SuperAgent:
-    agent = SuperAgent()
+async def initialize_multi_agent() -> MultiAgentOrchestrator:
+    """멀티 에이전트 시스템 초기화"""
+    orchestrator = MultiAgentOrchestrator()
 
     mcp1_connected = False
     mcp2_connected = False
@@ -197,9 +430,9 @@ async def initialize_super_agent() -> SuperAgent:
         mcp1_url = os.environ.get("MCP_SERVER_1_URL", "")
         mcp1_bearer = os.environ.get("MCP_SERVER_1_AUTH_BEARER", "")
         if mcp1_url:
-            print(f"Connecting to MCP Server 1: {mcp1_url}")
+            print(f"Connecting to MCP Server 1 (법률 도구): {mcp1_url}")
             try:
-                await agent.connect_mcp_server("mcp1", mcp1_url, mcp1_bearer)
+                await orchestrator.connect_mcp_server("mcp1", mcp1_url, mcp1_bearer)
                 print("✓ Connected to MCP Server 1")
                 mcp1_connected = True
             except Exception as e:
@@ -210,9 +443,9 @@ async def initialize_super_agent() -> SuperAgent:
         mcp2_url = os.environ.get("MCP_SERVER_2_URL", "")
         mcp2_bearer = os.environ.get("MCP_SERVER_2_AUTH_BEARER", "")
         if mcp2_url:
-            print(f"Connecting to MCP Server 2: {mcp2_url}")
+            print(f"Connecting to MCP Server 2 (판례 도구): {mcp2_url}")
             try:
-                await agent.connect_mcp_server("mcp2", mcp2_url, mcp2_bearer)
+                await orchestrator.connect_mcp_server("mcp2", mcp2_url, mcp2_bearer)
                 print("✓ Connected to MCP Server 2")
                 mcp2_connected = True
             except Exception as e:
@@ -228,18 +461,128 @@ async def initialize_super_agent() -> SuperAgent:
         if not mcp2_connected:
             print("⚠ Warning: MCP Server 2 is not connected, continuing with Server 1 only.")
 
-        print("Initializing Google ADK Agent...")
-        agent.initialize_agent()
-        print(f"✓ Agent initialized with {len(agent.all_tools)} tools")
+        print("\nInitializing Multi-Agent System...")
+        orchestrator.initialize_agents()
+        print(f"✓ Multi-Agent System initialized with {len(orchestrator.all_tools)} total tools\n")
 
-        return agent
+        return orchestrator
 
     except Exception as e:
-        # ExitStack이 알아서 이미 열린 리소스들 정리
-        raise RuntimeError(f"Failed to initialize super agent: {e}") from e
+        raise RuntimeError(f"Failed to initialize multi-agent system: {e}") from e
 
 
-async def run_conversation(agent: SuperAgent, user_query: str, max_iterations: int = 10) -> str:
+async def run_multi_agent_conversation(orchestrator: MultiAgentOrchestrator, user_query: str) -> str:
+    """멀티 에이전트 대화 실행: Agent A → Agent B/C"""
+
+    print(f"\n{'='*60}")
+    print(f"🤖 Multi-Agent Processing Pipeline")
+    print(f"{'='*60}\n")
+
+    # Step 1: Agent A - 질문 이해
+    print(f"📋 [Step 1] Agent A: 질문 분석")
+    print(f"─" * 60)
+
+    step1_start = time.time()
+    question_response = await orchestrator.question_agent.process(user_query)
+    step1_time = time.time() - step1_start
+
+    if not question_response.success:
+        print(f"❌ 질문 분석 실패: {question_response.content}")
+        return question_response.content
+
+    print(f"✅ 분석 완료 ({step1_time:.2f}초)")
+    print(f"\n{question_response.content}\n")
+
+    # JSON 파싱 시도
+    try:
+        # JSON 추출 (```json ... ``` 형식도 처리)
+        content = question_response.content
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+
+        analysis = json.loads(content)
+        next_agent = analysis.get("next_agent", "none")
+        question_type = analysis.get("question_type", "general")
+        structured_query = analysis.get("structured_query", user_query)
+
+        print(f"🎯 판단 결과:")
+        print(f"   질문 유형: {question_type}")
+        print(f"   다음 에이전트: {next_agent}")
+        print(f"   구조화된 쿼리: {structured_query}\n")
+
+    except json.JSONDecodeError:
+        print(f"⚠️  JSON 파싱 실패, 기본 처리로 진행\n")
+        next_agent = "legal_agent"  # 기본값
+        structured_query = user_query
+
+    # Step 2: Agent B 또는 C로 라우팅
+    if next_agent == "none" or next_agent not in ["legal_agent", "precedent_agent"]:
+        print(f"💬 [Final Answer] 추가 처리 불필요")
+        return question_response.content
+
+    # Step 2: 전문 에이전트 처리
+    if next_agent == "legal_agent":
+        print(f"⚖️  [Step 2] Agent B: 법률 전문가 처리")
+        print(f"─" * 60)
+        specialist_agent = orchestrator.legal_agent
+    else:  # precedent_agent
+        print(f"📚 [Step 2] Agent C: 판례 전문가 처리")
+        print(f"─" * 60)
+        specialist_agent = orchestrator.precedent_agent
+
+    step2_start = time.time()
+
+    # 컨텍스트 전달
+    context = {
+        "original_query": user_query,
+        "analysis": question_response.content,
+        "structured_query": structured_query
+    }
+
+    final_response = await specialist_agent.process_with_tools(structured_query, context)
+    step2_time = time.time() - step2_start
+
+    if not final_response.success:
+        print(f"❌ 처리 실패: {final_response.content}")
+        return final_response.content
+
+    print(f"\n✅ 처리 완료 ({step2_time:.2f}초)")
+
+    # Step 3: 최종 응답 스트리밍
+    print(f"\n💬 [Final Answer] ")
+    print(f"─" * 60)
+
+    # 스트리밍으로 최종 답변 출력
+    try:
+        messages = [
+            {"role": "system", "content": "이전 에이전트들의 분석 결과를 바탕으로 사용자에게 최종 답변을 제공하세요. 명확하고 이해하기 쉽게 설명하세요."},
+            {"role": "user", "content": f"원본 질문: {user_query}\n\n분석 결과:\n{question_response.content}\n\n전문가 답변:\n{final_response.content}"}
+        ]
+
+        stream_start = time.time()
+        stream_response = orchestrator.aoai_wrapper.chat_completion(messages, stream=True)
+
+        collected_content = ""
+        for chunk in stream_response:
+            if chunk.choices and len(chunk.choices) > 0:
+                delta = chunk.choices[0].delta
+                if hasattr(delta, 'content') and delta.content:
+                    print(delta.content, end="", flush=True)
+                    collected_content += delta.content
+
+        stream_time = time.time() - stream_start
+        print(f"\n\n⏱️  스트리밍 시간: {stream_time:.2f}초")
+
+        return collected_content
+
+    except ContentFilterError as e:
+        print(f"\n🚫 콘텐츠 필터링 차단: {', '.join(e.filtered_categories)}")
+        return final_response.content
+    except Exception as e:
+        print(f"\n⚠️  스트리밍 실패, 원본 응답 반환: {e}")
+        return final_response.content
     if not agent.agent or not agent.aoai_wrapper:
         raise RuntimeError("Agent not initialized")
 
