@@ -322,7 +322,23 @@ class MultiAgentOrchestrator:
         self.legal_agent: Optional[LegalExpertAgent] = None
         self.precedent_agent: Optional[PrecedentExpertAgent] = None
 
+    def _normalize_url(self, url: str) -> str:
+        return url if url.endswith("/") else url + "/"
+
+    def _prefix_tool(self, tool: BaseTool, prefix: str) -> BaseTool:
+        # 툴 클래스를 동적으로 감싸 name만 오버라이드
+        class PrefixedTool(tool.__class__):
+            @property
+            def name(self):
+                original = getattr(super(), "name", getattr(tool, "name", type(tool).__name__))
+                return f"{prefix}__{original}"
+
+        wrapped = PrefixedTool.__new__(PrefixedTool)
+        wrapped.__dict__ = tool.__dict__.copy()
+        return wrapped
+
     async def connect_mcp_server(self, server_name: str, base_url: str, auth_bearer: str = "") -> MCPServerConnection:
+        base_url = self._normalize_url(base_url)
         headers = {}
         if auth_bearer:
             headers["Authorization"] = f"Bearer {auth_bearer}"
@@ -341,6 +357,7 @@ class MultiAgentOrchestrator:
             )
             self.servers[server_name] = connection
             for tool in tools:
+                tool = self._prefix_tool(tool, server_name)
                 self.all_tools.append(tool)
             return connection
         except Exception as e:
