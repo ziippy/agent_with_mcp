@@ -246,7 +246,7 @@ class ToolBasedAgent(SpecializedAgent):
             context_str = f"\n\n[Context]\n{json.dumps(context, indent=2, ensure_ascii=False)}"
             messages[-1]["content"] += context_str
 
-        max_iterations = 5
+        max_iterations = 10
         for iteration in range(max_iterations):
             try:
                 response = self.aoai_wrapper.chat_completion(messages, tools=tools_for_openai, stream=False)
@@ -424,11 +424,9 @@ class MultiAgentOrchestrator:
             self.specialist_agents[server_name] = agent
             print(f"   • {agent.name}: {agent.role} (도구 {len(server_tools)}개)")
             # 도구 목록 출력
-            for tool in server_tools[:3]:  # 최대 3개만 표시
+            for tool in server_tools:
                 tool_name = getattr(tool, 'name', '')
                 print(f"      - {tool_name}")
-            if len(server_tools) > 3:
-                print(f"      ... and {len(server_tools) - 3} more tools")
 
     async def close_all_servers(self):
         """모든 MCP 서버 연결 종료"""
