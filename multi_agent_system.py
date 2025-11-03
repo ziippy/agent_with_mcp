@@ -151,25 +151,34 @@ class QuestionUnderstandingAgent(SpecializedAgent):
 사용자의 질문을 분석하여 다음을 추출합니다:
 1. 핵심 키워드
 2. 질문 유형 (법률+판례 복합, 법률만, 판례만, 일반)
-3. 필요한 후속 에이전트들 (배열로 복수 선택 가능)
+3. 필요한 후속 에이전트들과 **실행 순서**
 4. 각 에이전트별 구조화된 쿼리
+
+**중요: 에이전트 실행 순서를 논리적으로 결정하세요**
+- "법 내용 + 사례" → legal_agent 먼저, precedent_agent 나중
+- "사례 + 관련 법" → precedent_agent 먼저, legal_agent 나중 (사례 결과를 법률 검색에 활용)
 
 응답은 반드시 다음 JSON 형식으로 제공하세요:
 {
   "keywords": ["키워드1", "키워드2"],
   "question_type": "legal_and_precedent|legal_only|precedent_only|general",
-  "next_agents": ["legal_agent", "precedent_agent"] or ["legal_agent"] or ["precedent_agent"] or [],
+  "execution_order": ["legal_agent", "precedent_agent"] or ["precedent_agent", "legal_agent"] or ["legal_agent"] or ["precedent_agent"] or [],
   "queries": {
     "legal_agent": "법률 에이전트에게 할 질문 (해당되는 경우)",
     "precedent_agent": "판례 에이전트에게 할 질문 (해당되는 경우)"
   },
-  "analysis": "간단한 분석 설명"
+  "dependencies": {
+    "legal_agent": "이전 에이전트 결과 활용 방법 (해당되는 경우)",
+    "precedent_agent": "이전 에이전트 결과 활용 방법 (해당되는 경우)"
+  },
+  "analysis": "간단한 분석 설명 (실행 순서 이유 포함)"
 }
 
 예시:
-- "중대재해처벌법 + 최근 사례" → next_agents: ["legal_agent", "precedent_agent"]
-- "계약법 조항" → next_agents: ["legal_agent"]
-- "부당해고 판례" → next_agents: ["precedent_agent"]"""
+- "중대재해처벌법 설명 + 최근 사례" → execution_order: ["legal_agent", "precedent_agent"]
+- "최근 위반 사례 + 해당 법 조항" → execution_order: ["precedent_agent", "legal_agent"]
+- "계약법 조항" → execution_order: ["legal_agent"]
+- "부당해고 판례" → execution_order: ["precedent_agent"]"""
         super().__init__(
             name="QuestionUnderstandingAgent",
             role="질문 이해 및 분석",
@@ -379,10 +388,10 @@ class MultiAgentOrchestrator:
 
         self.question_agent = QuestionUnderstandingAgent(self.aoai_wrapper)
 
-        legal_tools = [tool for tool in self.all_tools if 'mcp1' in getattr(tool, 'name', '')]
+        legal_tools = [tool for tool in self.all_tools if getattr(tool, 'name', '').startswith('mcp1__')]
         self.legal_agent = LegalExpertAgent(self.aoai_wrapper, legal_tools if legal_tools else self.all_tools)
 
-        precedent_tools = [tool for tool in self.all_tools if 'mcp2' in getattr(tool, 'name', '')]
+        precedent_tools = [tool for tool in self.all_tools if getattr(tool, 'name', '').startswith('mcp2__')]
         self.precedent_agent = PrecedentExpertAgent(self.aoai_wrapper, precedent_tools if precedent_tools else self.all_tools)
 
         print(f"\n✅ 에이전트 초기화 완료:")
@@ -480,25 +489,30 @@ async def run_multi_agent_conversation(orchestrator: MultiAgentOrchestrator, use
             content = content.split("```")[1].split("```")[0].strip()
 
         analysis = json.loads(content)
-        next_agents = analysis.get("next_agents", [])
+        execution_order = analysis.get("execution_order", analysis.get("next_agents", []))  # 하위 호환성
         question_type = analysis.get("question_type", "general")
         queries = analysis.get("queries", {})
+        dependencies = analysis.get("dependencies", {})
 
         print(f"🎯 판단 결과:")
         print(f"   질문 유형: {question_type}")
-        print(f"   호출할 에이전트: {', '.join(next_agents) if next_agents else 'none'}")
+        print(f"   실행 순서: {' → '.join(execution_order) if execution_order else 'none'}")
         if queries:
-            for agent, query in queries.items():
-                print(f"   • {agent}: {query}")
+            for i, agent in enumerate(execution_order, 1):
+                if agent in queries:
+                    print(f"   {i}. {agent}: {queries[agent]}")
+                    if agent in dependencies:
+                        print(f"      └─ 의존성: {dependencies[agent]}")
         print()
 
     except json.JSONDecodeError:
         print(f"⚠️  JSON 파싱 실패, 기본 처리로 진행\n")
-        next_agents = ["legal_agent"]
+        execution_order = ["legal_agent"]
         queries = {"legal_agent": user_query}
+        dependencies = {}
 
     # Step 2: 전문 에이전트들 순차 실행
-    if not next_agents or len(next_agents) == 0:
+    if not execution_order or len(execution_order) == 0:
         # 일반 질문 - Agent A가 직접 답변 생성
         print(f"💬 [Final Answer] Agent A 직접 답변")
         print(f"{'─'*70}\n")
@@ -535,9 +549,11 @@ async def run_multi_agent_conversation(orchestrator: MultiAgentOrchestrator, use
             return question_response.content
 
     agent_results = {}
+    previous_results = []  # 이전 에이전트들의 결과 누적
     step_num = 2
 
-    for agent_name in next_agents:
+    # execution_order 순서대로 에이전트 실행
+    for agent_name in execution_order:
         if agent_name not in ["legal_agent", "precedent_agent"]:
             continue
 
@@ -553,35 +569,53 @@ async def run_multi_agent_conversation(orchestrator: MultiAgentOrchestrator, use
             emoji = "📚"
 
         query = queries.get(agent_name, user_query)
-        print(f"질문: {query}\n")
+        dependency = dependencies.get(agent_name, "")
+
+        print(f"질문: {query}")
+        if dependency and previous_results:
+            print(f"의존성: {dependency}")
+        print()
 
         step_start = time.time()
 
+        # 컨텍스트 구성: 이전 에이전트 결과 포함
         context = {
             "original_query": user_query,
             "analysis": question_response.content,
-            "structured_query": query
+            "structured_query": query,
         }
+
+        # 이전 에이전트들의 결과 추가
+        if previous_results:
+            context["previous_agent_results"] = previous_results
+            if dependency:
+                context["dependency_instruction"] = dependency
 
         response = await specialist_agent.process_with_tools(query, context)
         step_time = time.time() - step_start
 
         if response.success:
             print(f"\n✅ {emoji} 처리 완료 ({step_time:.2f}초)\n")
-            agent_results[agent_name] = {
+            result_info = {
                 "agent": specialist_agent.name,
+                "agent_name": agent_name,
                 "query": query,
                 "response": response.content,
                 "time": step_time
             }
+            agent_results[agent_name] = result_info
+            previous_results.append(result_info)  # 다음 에이전트를 위해 결과 저장
         else:
             print(f"\n❌ {emoji} 처리 실패: {response.content}\n")
-            agent_results[agent_name] = {
+            result_info = {
                 "agent": specialist_agent.name,
+                "agent_name": agent_name,
                 "query": query,
                 "response": f"[ERROR] {response.content}",
                 "time": step_time
             }
+            agent_results[agent_name] = result_info
+            previous_results.append(result_info)
 
         step_num += 1
 
@@ -594,29 +628,30 @@ async def run_multi_agent_conversation(orchestrator: MultiAgentOrchestrator, use
     print(f"{'─'*70}\n")
 
     try:
-        # 전문가 답변들을 구조화
+        # 전문가 답변들을 실행 순서대로 구조화
         expert_answers = ""
-        for agent_name, result in agent_results.items():
-            expert_answers += f"\n\n[{result['agent']}의 답변]\n질문: {result['query']}\n답변: {result['response']}"
+        for i, agent_name in enumerate(execution_order, 1):
+            if agent_name in agent_results:
+                result = agent_results[agent_name]
+                expert_answers += f"\n\n[{i}단계: {result['agent']}의 답변]\n질문: {result['query']}\n답변: {result['response']}"
 
         messages = [
             {"role": "system", "content": """당신은 여러 전문가의 답변을 통합하여 사용자에게 최종 답변을 제공하는 코디네이터입니다.
-각 전문가의 답변을 종합하여:
+각 전문가의 답변을 **실행된 순서대로** 종합하여:
 1. 사용자 질문에 대한 명확한 답변
-2. 법률 전문가와 판례 전문가의 답변을 논리적으로 연결
+2. 에이전트들의 답변을 논리적 흐름에 맞게 연결
 3. 이해하기 쉽고 체계적인 설명
 
-다음 구조로 답변하세요:
-- 개요
-- 법률적 설명 (법률 전문가 답변 기반)
-- 실제 사례 (판례 전문가 답변 기반)
+답변 구조를 자유롭게 구성하되, 다음을 포함하세요:
+- 개요/요약
+- 각 전문가의 답변 내용 (순서대로)
 - 결론 및 시사점"""},
             {"role": "user", "content": f"""원본 질문: {user_query}
 
 질문 분석:
 {question_response.content}
 
-전문가 답변들:
+전문가 답변들 (실행 순서):
 {expert_answers}
 
 위 내용을 바탕으로 사용자에게 최종 답변을 제공해주세요."""}
