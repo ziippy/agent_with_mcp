@@ -165,37 +165,111 @@ class QuestionUnderstandingAgent(SpecializedAgent):
         system_prompt = f"""당신은 질문 분석 및 라우팅 전문가입니다.
 사용자의 질문을 분석하여 적절한 전문 에이전트에게 라우팅합니다.
 
-사용 가능한 에이전트 및 도구: {tools_info_str}
+**사용 가능한 에이전트 목록:**
+{agents_str}
 
-**중요**: 각 에이전트가 가진 도구를 보고 어떤 역할을 하는지 추론하세요.
-예: precedent-search, case-search → 판례/사례 검색
-    law-search, statute-search → 법률/조문 검색
-    web-search → 웹 검색
+**각 에이전트가 제공하는 도구:**{tools_info_str}
+
+**⚠️ 매우 중요 - execution_order 작성 규칙:**
+1. execution_order에는 **반드시 에이전트 이름만** 사용하세요
+2. 사용 가능한 에이전트 이름: {agents_str}
+3. 도구 이름을 절대 사용하지 마세요
+
+**에이전트 역할 추론 (도구를 보고 판단):**
+각 에이전트가 제공하는 도구를 보고 어떤 역할을 하는지 추론한 후, **에이전트 이름**을 사용하세요.
+
+**잘못된 예시 (절대 사용 금지):**
+❌ execution_order: [["law-search", "precedent-search"]]  <- 도구 이름 사용
+❌ execution_order: [["web-search"]]  <- 도구 이름 사용
+
+**올바른 예시:**
+✅ execution_order: [["{agents_str.split(', ')[0] if agents_str else 'mcp1'}", "{agents_str.split(', ')[1] if ', ' in agents_str else 'mcp2'}"]]  <- 에이전트 이름 사용
+✅ execution_order: [["{agents_str.split(', ')[0] if agents_str else 'mcp1'}"]]  <- 에이전트 이름 사용
 
 **중요 원칙:**
 1. 질문이 여러 에이전트를 필요로 하면 **실행 순서**를 논리적으로 결정
-2. 나중 에이전트가 이전 에이전트 결과를 활용할 수 있으면 의존성 명시
-3. 일반적인 대화는 에이전트를 호출하지 않음 (execution_order: [])
+2. **병렬 실행이 유리한 경우 여러 에이전트를 동시에 실행**할 수 있습니다
+3. **나중 에이전트가 이전 에이전트 결과를 활용해야 하면 의존성을 명시하여 순차 실행**
+4. 일반적인 대화는 에이전트를 호출하지 않음 (execution_order: [])
 
-응답은 반드시 다음 JSON 형식으로 제공하세요:
+**병렬 vs 순차 실행 판단 기준:**
+
+🔀 **병렬 실행 (동시에 독립적으로 검색):**
+- 두 에이전트의 작업이 **서로 독립적**일 때
+- 한 에이전트의 결과가 다른 에이전트의 입력으로 필요하지 않을 때
+- 예: "12대 중과실은 뭐야?" → 법률 조문과 판례를 동시에 검색 가능
+  - execution_order: [["agent1", "agent2"]]
+  - 두 검색이 서로 독립적임
+
+⏭️ **순차 실행 (첫 번째 결과를 두 번째가 활용):**
+- 나중 에이전트가 **이전 에이전트의 결과를 참고**해야 할 때
+- "찾아보고 ~해줘", "검색한 후 ~해줘", "바탕으로 ~해줘" 같은 표현이 있을 때
+- 예: "최근 근로기준법 위반 사례를 찾아보고, 해당 법 조항을 알려줘"
+  - execution_order: [["agent1"], ["agent2"]]
+  - agent2는 agent1의 결과(위반 사례)를 보고 관련 법 조항을 검색해야 함
+  - dependencies: {{"agent2": "agent1에서 찾은 위반 사례를 분석하여 해당 법 조항 검색"}}
+
+**응답 형식 (JSON):**
 {{
   "keywords": ["키워드1", "키워드2"],
-  "question_type": "single|multiple|general",
-  "execution_order": ["{available_agents[0] if available_agents else 'agent_name'}"] or ["{available_agents[1] if len(available_agents) > 1 else 'agent_name'}"] or [],
+  "question_type": "single|multiple|parallel|general",
+  "execution_order": [["agent_name1"], ["agent_name2", "agent_name3"]],
   "queries": {{
-    "agent_name": "해당 에이전트에게 할 구체적인 질문"
+    "agent_name1": "해당 에이전트에게 할 구체적인 질문",
+    "agent_name2": "해당 에이전트에게 할 구체적인 질문"
   }},
   "dependencies": {{
     "agent_name": "이전 에이전트 결과 활용 방법 (선택사항)"
   }},
-  "analysis": "질문 분석 및 실행 순서 이유"
+  "analysis": "질문 분석 및 실행 순서(순차/병렬) 결정 이유"
 }}
 
-예시 (available_agents: ["mcp1", "mcp2"]):
-- 단일 에이전트: execution_order: ["mcp1"]
-- 복합 (순차): execution_order: ["mcp1", "mcp2"]
-- 복합 (역순): execution_order: ["mcp2", "mcp1"] 
-- 일반 대화: execution_order: []"""
+**execution_order 작성 규칙:**
+⚠️ CRITICAL: execution_order에는 반드시 실제 에이전트 이름만 사용하세요!
+사용 가능: {agents_str}
+사용 금지: 도구 이름 (law-search, precedent-search 등)
+
+**형식 예시:**
+- `[["{available_agents[0] if available_agents else 'mcp1'}"]]`: 단일 에이전트 실행
+- `[["{available_agents[0] if available_agents else 'mcp1'}"], ["{available_agents[1] if len(available_agents) > 1 else 'mcp2'}"]]`: 순차 실행
+- `[["{available_agents[0] if available_agents else 'mcp1'}", "{available_agents[1] if len(available_agents) > 1 else 'mcp2'}"]]`: 병렬 실행
+- `[]`: 일반 대화 (에이전트 미호출)
+
+**구체적인 예시 시나리오:**
+
+1️⃣ **병렬 실행 예시:**
+질문: "12대 중과실이 뭐야?"
+분석: 법률 조문과 판례를 동시에 검색 가능 (독립적)
+```json
+{{
+  "question_type": "parallel",
+  "execution_order": [["{available_agents[0] if available_agents else 'mcp1'}", "{available_agents[1] if len(available_agents) > 1 else 'mcp2'}"]],
+  "queries": {{
+    "{available_agents[0] if available_agents else 'mcp1'}": "12대 중과실의 법률적 정의를 검색",
+    "{available_agents[1] if len(available_agents) > 1 else 'mcp2'}": "12대 중과실 관련 판례를 검색"
+  }},
+  "dependencies": {{}},
+  "analysis": "법률 조문과 판례는 독립적으로 검색 가능하므로 병렬 실행"
+}}
+```
+
+2️⃣ **순차 실행 예시 (의존성 있음):**
+질문: "최근 근로기준법 위반 사례를 찾아보고, 해당 법 조항을 알려줘"
+분석: 첫 번째로 사례 검색 → 그 결과를 바탕으로 법 조항 검색 (의존적)
+```json
+{{
+  "question_type": "multiple",
+  "execution_order": [["{available_agents[0] if available_agents else 'mcp1'}"], ["{available_agents[1] if len(available_agents) > 1 else 'mcp2'}"]],
+  "queries": {{
+    "{available_agents[0] if available_agents else 'mcp1'}": "최근 근로기준법 위반 사례를 검색",
+    "{available_agents[1] if len(available_agents) > 1 else 'mcp2'}": "위반 사례에 해당하는 근로기준법 조항을 검색"
+  }},
+  "dependencies": {{
+    "{available_agents[1] if len(available_agents) > 1 else 'mcp2'}": "첫 번째 에이전트가 찾은 위반 사례를 분석하여 해당되는 법 조항 검색"
+  }},
+  "analysis": "사례를 먼저 찾은 후, 그 사례에 해당하는 법 조항을 검색해야 하므로 순차 실행"
+}}
+```"""
         super().__init__(
             name="QuestionUnderstandingAgent",
             role="질문 이해 및 라우팅",
@@ -427,6 +501,8 @@ class MultiAgentOrchestrator:
             for tool in server_tools:
                 tool_name = getattr(tool, 'name', '')
                 print(f"      - {tool_name}")
+                # tool_description = getattr(tool, 'description', '')
+                # print(f"      - {tool_name} {tool_description}")
 
     async def close_all_servers(self):
         """모든 MCP 서버 연결 종료"""
@@ -528,11 +604,23 @@ async def run_multi_agent_conversation(orchestrator: MultiAgentOrchestrator, use
 
         print(f"🎯 판단 결과:")
         print(f"   질문 유형: {question_type}")
-        print(f"   실행 순서: {' → '.join(execution_order) if execution_order else 'none'}")
+
+        # execution_order를 보기 좋게 출력 (병렬은 괄호로, 순차는 화살표로)
+        if execution_order:
+            execution_plan_str = " → ".join([
+                f"({', '.join(group)})" if len(group) > 1 else group[0]
+                for group in execution_order
+            ])
+            print(f"   실행 순서: {execution_plan_str}")
+        else:
+            print(f"   실행 순서: none")
+
+        # 각 에이전트별 질문 출력
         if queries:
-            for i, agent in enumerate(execution_order, 1):
+            flat_order = [agent for group in execution_order for agent in group]
+            for agent in flat_order:
                 if agent in queries:
-                    print(f"   {i}. {agent}: {queries[agent]}")
+                    print(f"   - {agent}: {queries[agent]}")
                     if agent in dependencies:
                         print(f"      └─ 의존성: {dependencies[agent]}")
         print()
@@ -580,54 +668,117 @@ async def run_multi_agent_conversation(orchestrator: MultiAgentOrchestrator, use
     previous_results = []
     step_num = 2
 
-    # execution_order 순서대로 에이전트 실행
-    for agent_name in execution_order:
-        if agent_name not in orchestrator.specialist_agents:
-            print(f"⚠️  에이전트 '{agent_name}' not found, skipping...")
+    # execution_order를 그룹별로 실행 (각 그룹 내부는 병렬, 그룹 간은 순차)
+    for group_idx, agent_group in enumerate(execution_order):
+        if not agent_group:
             continue
 
-        specialist_agent = orchestrator.specialist_agents[agent_name]
+        # 단일 에이전트 (순차 실행)
+        if len(agent_group) == 1:
+            agent_name = agent_group[0]
+            if agent_name not in orchestrator.specialist_agents:
+                print(f"⚠️  에이전트 '{agent_name}' not found, skipping...")
+                continue
 
-        print(f"🔧 [Step {step_num}] {specialist_agent.name} 처리")
-        print(f"{'─'*70}")
+            specialist_agent = orchestrator.specialist_agents[agent_name]
+            print(f"🔧 [Step {step_num}] {specialist_agent.name} 처리 (순차)")
+            print(f"{'─'*70}")
 
-        query = queries.get(agent_name, user_query)
-        dependency = dependencies.get(agent_name, "")
+            query = queries.get(agent_name, user_query)
+            dependency = dependencies.get(agent_name, "")
 
-        print(f"질문: {query}")
-        if dependency and previous_results:
-            print(f"의존성: {dependency}")
-        print()
+            print(f"질문: {query}")
+            if dependency and previous_results:
+                print(f"의존성: {dependency}")
+            print()
 
-        step_start = time.time()
-
-        context = {
-            "original_query": user_query,
-            "analysis": question_response.content,
-            "structured_query": query,
-        }
-
-        if previous_results:
-            context["previous_agent_results"] = previous_results
-            if dependency:
-                context["dependency_instruction"] = dependency
-
-        response = await specialist_agent.process_with_tools(query, context)
-        step_time = time.time() - step_start
-
-        if response.success:
-            print(f"\n✅ 처리 완료 ({step_time:.2f}초)\n")
-            result_info = {
-                "agent": specialist_agent.name,
-                "agent_name": agent_name,
-                "query": query,
-                "response": response.content,
-                "time": step_time
+            step_start = time.time()
+            context = {
+                "original_query": user_query,
+                "analysis": question_response.content,
+                "structured_query": query,
             }
-            agent_results[agent_name] = result_info
-            previous_results.append(result_info)
+            if previous_results:
+                context["previous_agent_results"] = previous_results
+                if dependency:
+                    context["dependency_instruction"] = dependency
+
+            response = await specialist_agent.process_with_tools(query, context)
+            step_time = time.time() - step_start
+
+            if response.success:
+                print(f"\n✅ 처리 완료 ({step_time:.2f}초)\n")
+                result_info = {
+                    "agent": specialist_agent.name,
+                    "agent_name": agent_name,
+                    "query": query,
+                    "response": response.content,
+                    "time": step_time
+                }
+                agent_results[agent_name] = result_info
+                previous_results.append(result_info)
+            else:
+                print(f"\n❌ 처리 실패: {response.content}\n")
+
+        # 여러 에이전트 (병렬 실행)
         else:
-            print(f"\n❌ 처리 실패: {response.content}\n")
+            print(f"🚀 [Step {step_num}] {len(agent_group)}개 에이전트 병렬 처리: {', '.join(agent_group)}")
+            print(f"{'─'*70}")
+
+            tasks = []
+            task_agent_names = []
+
+            for agent_name in agent_group:
+                if agent_name not in orchestrator.specialist_agents:
+                    print(f"⚠️  에이전트 '{agent_name}' not found, skipping...")
+                    continue
+
+                specialist_agent = orchestrator.specialist_agents[agent_name]
+                query = queries.get(agent_name, user_query)
+                dependency = dependencies.get(agent_name, "")
+
+                print(f"  - {specialist_agent.name}")
+                print(f"    질문: {query}")
+                if dependency and previous_results:
+                    print(f"    의존성: {dependency}")
+
+                context = {
+                    "original_query": user_query,
+                    "analysis": question_response.content,
+                    "structured_query": query,
+                }
+                if previous_results:
+                    context["previous_agent_results"] = previous_results
+                    if dependency:
+                        context["dependency_instruction"] = dependency
+
+                tasks.append(specialist_agent.process_with_tools(query, context))
+                task_agent_names.append(agent_name)
+
+            if tasks:
+                print()
+                step_start = time.time()
+                parallel_responses = await asyncio.gather(*tasks)
+                step_time = time.time() - step_start
+
+                print(f"✅ 병렬 처리 완료 ({step_time:.2f}초)\n")
+
+                # 병렬 처리 결과를 순서대로 저장
+                for agent_name, response in zip(task_agent_names, parallel_responses):
+                    if response.success:
+                        result_info = {
+                            "agent": response.agent_name,
+                            "agent_name": agent_name,
+                            "query": queries.get(agent_name, user_query),
+                            "response": response.content,
+                            "time": step_time  # 병렬 실행은 전체 시간 사용
+                        }
+                        agent_results[agent_name] = result_info
+                        previous_results.append(result_info)
+                        print(f"  ✓ {response.agent_name}: 성공")
+                    else:
+                        print(f"  ✗ {response.agent_name}: 실패 - {response.content}")
+                print()
 
         step_num += 1
 
@@ -640,7 +791,9 @@ async def run_multi_agent_conversation(orchestrator: MultiAgentOrchestrator, use
 
     try:
         expert_answers = ""
-        for i, agent_name in enumerate(execution_order, 1):
+        # execution_order를 flat하게 만들어서 순서대로 출력
+        flat_execution_order = [agent for group in execution_order for agent in group]
+        for i, agent_name in enumerate(flat_execution_order, 1):
             if agent_name in agent_results:
                 result = agent_results[agent_name]
                 expert_answers += f"\n\n[{i}단계: {result['agent']}의 답변]\n질문: {result['query']}\n답변: {result['response']}"
