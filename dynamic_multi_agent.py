@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import json
 import asyncio
@@ -6,7 +7,17 @@ from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
-from openai import AzureOpenAI, BadRequestError
+from openai import AzureOpenAI, OpenAI, BadRequestError
+
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
+
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 
 from google.adk.tools import BaseTool
 from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
@@ -16,32 +27,210 @@ load_dotenv()
 
 
 class ContentFilterError(Exception):
-    """Azure OpenAI 콘텐츠 필터링 에러"""
+    """LLM 콘텐츠 필터링 에러"""
     def __init__(self, filtered_categories: List[str], original_error: Exception):
         self.filtered_categories = filtered_categories
         self.original_error = original_error
         super().__init__(f"Content filtered: {', '.join(filtered_categories)}")
 
 
-class AzureOpenAIWrapper:
-    """Azure OpenAI 래퍼"""
+class LLMClient:
+    """범용 LLM 클라이언트 - Azure OpenAI, OpenAI, vLLM, Google Gemini, Anthropic Claude, xAI Grok 지원"""
 
-    def __init__(self, api_key: str, api_version: str, azure_endpoint: str, deployment: str):
+    def __init__(
+        self,
+        provider: str = "azure",  # "azure", "openai", "vllm", "google", "anthropic", "xai"
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+        # Azure OpenAI 전용
+        api_version: Optional[str] = None,
+        azure_endpoint: Optional[str] = None,
+        deployment: Optional[str] = None,
+    ):
+        """
+        LLM 클라이언트 초기화
+
+        Args:
+            provider: LLM 제공자 ("azure", "openai", "vllm", "google", "anthropic", "xai")
+            api_key: API 키
+            base_url: 기본 URL (OpenAI, vLLM, Google, Anthropic, xAI용)
+            model: 모델 이름 (OpenAI, vLLM, Google, Anthropic, xAI용)
+            api_version: API 버전 (Azure OpenAI용)
+            azure_endpoint: Azure 엔드포인트 (Azure OpenAI용)
+            deployment: 배포 이름 (Azure OpenAI용)
+        """
+        self.provider = provider.lower()
+        self.model = model or deployment
+
         try:
-            self.client = AzureOpenAI(
-                api_key=api_key,
-                api_version=api_version,
-                azure_endpoint=azure_endpoint,
-            )
-            self.deployment = deployment
+            if self.provider == "azure":
+                self.client = AzureOpenAI(
+                    api_key=api_key,
+                    api_version=api_version,
+                    azure_endpoint=azure_endpoint,
+                )
+                self.model = deployment
+                print(f"[LLM] Azure OpenAI initialized (deployment: {deployment})")
+
+            elif self.provider == "openai":
+                # OpenAI 초기화 - base_url이 없으면 기본값 사용
+                init_kwargs = {
+                    "api_key": api_key,
+                }
+                if base_url:  # base_url이 있을 때만 전달
+                    init_kwargs["base_url"] = base_url
+
+                self.client = OpenAI(**init_kwargs)
+
+                # 디버깅 정보 출력
+                print(f"[LLM] OpenAI initialized")
+                print(f"[LLM]   Model: {model}")
+                print(f"[LLM]   API Key: {api_key[:20]}..." if api_key else "[LLM]   API Key: None")
+                print(f"[LLM]   Base URL: {base_url if base_url else 'default (https://api.openai.com/v1)'}")
+
+            elif self.provider == "vllm":
+                # vLLM은 OpenAI 호환 API를 제공
+                # UTF-8 인코딩 문제 해결을 위한 명시적 설정
+                import httpx
+                import json as json_lib
+
+                # UTF-8을 강제하는 커스텀 JSON serializer
+                def utf8_json_serializer(obj):
+                    return json_lib.dumps(obj, ensure_ascii=False).encode('utf-8')
+
+                # UTF-8을 지원하는 HTTP 클라이언트 생성
+                http_client = httpx.Client(
+                    timeout=httpx.Timeout(60.0, connect=10.0),
+                    limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+                    headers={
+                        "Content-Type": "application/json; charset=utf-8",
+                        "Accept": "application/json",
+                        "Accept-Charset": "utf-8"
+                    }
+                )
+
+                # httpx의 기본 JSON serializer를 UTF-8을 지원하는 것으로 교체
+                # 하지만 OpenAI 클라이언트는 이를 직접 사용하지 않으므로
+                # 메시지 전처리를 chat_completion에서 수행
+
+                self.client = OpenAI(
+                    api_key=api_key or "EMPTY",  # vLLM은 API 키가 필요없을 수 있음
+                    base_url=base_url,
+                    http_client=http_client,
+                    default_headers={
+                        "Content-Type": "application/json; charset=utf-8"
+                    }
+                )
+
+                # OpenAI 클라이언트 내부의 JSON serialization을 패치
+                # 이것이 가장 확실한 UTF-8 인코딩 보장 방법
+                import functools
+                original_dumps = json_lib.dumps
+
+                @functools.wraps(original_dumps)
+                def utf8_dumps(*args, **kwargs):
+                    # ensure_ascii=False를 기본값으로 설정
+                    kwargs.setdefault('ensure_ascii', False)
+                    return original_dumps(*args, **kwargs)
+
+                # json.dumps를 패치 (vLLM 사용 시에만)
+                json_lib.dumps = utf8_dumps
+
+                print(f"[LLM] vLLM initialized (base_url: {base_url}, model: {model})")
+                print(f"[LLM] UTF-8 encoding explicitly configured for vLLM")
+                print(f"[LLM] JSON serialization patched for UTF-8 support")
+
+            elif self.provider == "google":
+                if genai is None:
+                    raise ImportError("google-generativeai 패키지가 설치되지 않았습니다. 'pip install google-generativeai'를 실행하세요.")
+
+                # base_url이 있으면 OpenAI 호환 모드 사용
+                if base_url:
+                    # Gemini OpenAI compatibility mode
+                    self.client = OpenAI(
+                        api_key=api_key,
+                        base_url=base_url,
+                    )
+                    self.model = model or "gemini-2.0-flash-exp"
+                    self.use_openai_compat = True
+                    print(f"[LLM] Google Gemini initialized (OpenAI compatibility mode)")
+                    print(f"[LLM]   Model: {self.model}")
+                    print(f"[LLM]   Base URL: {base_url}")
+                else:
+                    # 네이티브 Gemini SDK 사용
+                    genai.configure(api_key=api_key)
+                    self.client = genai.GenerativeModel(model or "gemini-1.5-pro")
+                    self.model = model or "gemini-1.5-pro"
+                    self.use_openai_compat = False
+                    print(f"[LLM] Google Gemini initialized (Native SDK mode, model: {self.model})")
+
+            elif self.provider == "anthropic":
+                if anthropic is None:
+                    raise ImportError("anthropic 패키지가 설치되지 않았습니다. 'pip install anthropic'를 실행하세요.")
+
+                # base_url이 있으면 OpenAI 호환 모드 사용 가능
+                if base_url:
+                    # Anthropic도 OpenAI 호환 API를 제공할 수 있음
+                    self.client = OpenAI(
+                        api_key=api_key,
+                        base_url=base_url,
+                    )
+                    self.model = model or "claude-3-5-sonnet-20241022"
+                    self.use_openai_compat = True
+                    print(f"[LLM] Anthropic Claude initialized (OpenAI compatibility mode)")
+                    print(f"[LLM]   Model: {self.model}")
+                    print(f"[LLM]   Base URL: {base_url}")
+                else:
+                    # 네이티브 Anthropic SDK 사용
+                    self.client = anthropic.Anthropic(api_key=api_key)
+                    self.model = model or "claude-3-5-sonnet-20241022"
+                    self.use_openai_compat = False
+                    print(f"[LLM] Anthropic Claude initialized (Native SDK mode, model: {self.model})")
+
+            elif self.provider == "xai":
+                # xAI Grok은 OpenAI 호환 API 제공
+                self.client = OpenAI(
+                    api_key=api_key,
+                    base_url=base_url or "https://api.x.ai/v1",
+                )
+                self.model = model or "grok-beta"
+                print(f"[LLM] xAI Grok initialized")
+                print(f"[LLM]   Model: {self.model}")
+                print(f"[LLM]   Base URL: {base_url or 'https://api.x.ai/v1'}")
+
+            else:
+                raise ValueError(f"Unsupported provider: {provider}. Use 'azure', 'openai', 'vllm', 'google', 'anthropic', or 'xai'")
+
         except Exception as e:
-            print("[AOAI] init failed ->", e)
+            print(f"[LLM] Initialization failed -> {e}")
+            raise
 
     def chat_completion(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None, stream: bool = False):
-        """Azure OpenAI Chat Completion 호출"""
+        """LLM Chat Completion 호출"""
         try:
+            # Google Gemini (Native SDK)
+            if self.provider == "google" and not getattr(self, 'use_openai_compat', False):
+                return self._gemini_chat_completion(messages, tools, stream)
+
+            # Anthropic Claude (Native SDK)
+            elif self.provider == "anthropic" and not getattr(self, 'use_openai_compat', False):
+                return self._claude_chat_completion(messages, tools, stream)
+
+            # vLLM의 경우 한글 등 non-ASCII 문자 처리를 위한 추가 처리
+            elif self.provider == "vllm":
+                # 메시지를 JSON으로 직렬화한 후 다시 파싱하여 UTF-8 인코딩 보장
+                import json as json_lib
+                try:
+                    # ensure_ascii=False로 UTF-8 문자 보존
+                    messages_json = json_lib.dumps(messages, ensure_ascii=False)
+                    messages = json_lib.loads(messages_json)
+                except Exception as e:
+                    print(f"[LLM] Warning: Failed to process messages for UTF-8: {e}")
+
+            # OpenAI 호환 API (Azure, OpenAI, vLLM, Google OpenAI-compat, Anthropic OpenAI-compat, xAI)
             kwargs = {
-                "model": self.deployment,
+                "model": self.model,
                 "messages": messages,
                 "temperature": 0.2,
                 "stream": stream,
@@ -52,9 +241,38 @@ class AzureOpenAIWrapper:
                 kwargs["tool_choice"] = "auto"
 
             return self.client.chat.completions.create(**kwargs)
+
+        except UnicodeEncodeError as e:
+            # 인코딩 에러 처리
+            error_msg = f"인코딩 에러: {str(e)}\n"
+            error_msg += f"Provider: {self.provider}\n"
+            error_msg += f"Model: {self.model}\n"
+            error_msg += "vLLM 사용 시 모델이 UTF-8을 지원하는지 확인하세요."
+            raise Exception(error_msg)
+
         except BadRequestError as e:
             error_str = str(e)
 
+            # OpenAI API 에러 처리
+            if hasattr(e, 'status_code'):
+                if e.status_code == 429:
+                    raise Exception(f"OpenAI API 할당량 초과 또는 Rate Limit: {error_str}\n"
+                                  f"Provider: {self.provider}\n"
+                                  f"Model: {self.model}\n"
+                                  f"해결 방법:\n"
+                                  f"1. API 키의 크레딧을 확인하세요\n"
+                                  f"2. 올바른 API 키가 설정되었는지 확인하세요\n"
+                                  f"3. Rate Limit인 경우 잠시 후 다시 시도하세요")
+                elif e.status_code == 401:
+                    raise Exception(f"OpenAI API 인증 실패: {error_str}\n"
+                                  f"API 키가 올바른지 확인하세요")
+                elif e.status_code == 404:
+                    raise Exception(f"모델을 찾을 수 없음: {error_str}\n"
+                                  f"Model: {self.model}\n"
+                                  f"올바른 모델명을 사용하고 있는지 확인하세요\n"
+                                  f"사용 가능한 모델: gpt-4o, gpt-4o-mini, gpt-4-turbo, gpt-3.5-turbo")
+
+            # Azure OpenAI 콘텐츠 필터링 처리
             if 'content_filter' in error_str or 'content management policy' in error_str.lower():
                 error_body = getattr(e, 'body', None)
                 filtered_categories = []
@@ -79,6 +297,102 @@ class AzureOpenAIWrapper:
 
             raise
 
+        except Exception as e:
+            # 기타 에러에 대한 디버깅 정보 추가
+            if self.provider == "vllm":
+                error_msg = f"vLLM 호출 실패: {str(e)}\n"
+                error_msg += f"Base URL: {self.client.base_url}\n"
+                error_msg += f"Model: {self.model}\n"
+                error_msg += "vLLM 서버가 실행 중인지, 모델이 로드되었는지 확인하세요."
+                raise Exception(error_msg) from e
+            raise
+
+    def _gemini_chat_completion(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None, stream: bool = False):
+        """Gemini API 호출"""
+        # Gemini는 OpenAI와 다른 메시지 형식 사용
+        # system 메시지를 분리하고 user/assistant 메시지만 전달
+        system_instruction = None
+        chat_messages = []
+
+        for msg in messages:
+            if msg["role"] == "system":
+                system_instruction = msg["content"]
+            elif msg["role"] == "user":
+                chat_messages.append({"role": "user", "parts": [msg["content"]]})
+            elif msg["role"] == "assistant":
+                chat_messages.append({"role": "model", "parts": [msg["content"]]})
+
+        # 새 모델 인스턴스 생성 (system instruction 포함)
+        if system_instruction:
+            model = genai.GenerativeModel(
+                model_name=self.model,
+                system_instruction=system_instruction
+            )
+        else:
+            model = self.client
+
+        # Tool calling은 Gemini에서 별도 처리 필요 (여기서는 기본 구현)
+        response = model.generate_content(
+            chat_messages[-1]["parts"] if chat_messages else "",
+            generation_config=genai.types.GenerationConfig(temperature=0.2)
+        )
+
+        # OpenAI 형식으로 변환
+        class GeminiResponse:
+            def __init__(self, text):
+                self.choices = [type('obj', (object,), {
+                    'message': type('obj', (object,), {
+                        'content': text,
+                        'role': 'assistant'
+                    })()
+                })()]
+
+        return GeminiResponse(response.text)
+
+    def _claude_chat_completion(self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None, stream: bool = False):
+        """Claude API 호출"""
+        # Claude는 system 메시지를 별도 파라미터로 받음
+        system_message = None
+        claude_messages = []
+
+        for msg in messages:
+            if msg["role"] == "system":
+                system_message = msg["content"]
+            else:
+                claude_messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+
+        kwargs = {
+            "model": self.model,
+            "messages": claude_messages,
+            "max_tokens": 4096,
+            "temperature": 0.2,
+        }
+
+        if system_message:
+            kwargs["system"] = system_message
+
+        # Tool calling은 Claude에서 별도 처리 필요 (여기서는 기본 구현)
+        if tools:
+            # Claude의 tool 형식으로 변환 필요
+            pass
+
+        response = self.client.messages.create(**kwargs)
+
+        # OpenAI 형식으로 변환
+        class ClaudeResponse:
+            def __init__(self, content):
+                self.choices = [type('obj', (object,), {
+                    'message': type('obj', (object,), {
+                        'content': content,
+                        'role': 'assistant'
+                    })()
+                })()]
+
+        return ClaudeResponse(response.content[0].text)
+
 
 @dataclass
 class MCPServerConnection:
@@ -99,11 +413,11 @@ class AgentResponse:
 class SpecializedAgent:
     """특화된 에이전트 기본 클래스"""
 
-    def __init__(self, name: str, role: str, system_prompt: str, aoai_wrapper: AzureOpenAIWrapper):
+    def __init__(self, name: str, role: str, system_prompt: str, llm_client: LLMClient):
         self.name = name
         self.role = role
         self.system_prompt = system_prompt
-        self.aoai_wrapper = aoai_wrapper
+        self.llm_client = llm_client
 
     async def process(self, user_input: str, context: Optional[Dict[str, Any]] = None) -> AgentResponse:
         """에이전트 처리"""
@@ -117,7 +431,7 @@ class SpecializedAgent:
             messages[-1]["content"] += context_str
 
         try:
-            response = self.aoai_wrapper.chat_completion(messages, stream=False)
+            response = self.llm_client.chat_completion(messages, stream=False)
             content = response.choices[0].message.content or ""
 
             return AgentResponse(
@@ -145,10 +459,10 @@ class SpecializedAgent:
 class QuestionUnderstandingAgent(SpecializedAgent):
     """Agent A: 질문 이해 및 라우팅 담당"""
 
-    def __init__(self, aoai_wrapper: AzureOpenAIWrapper, available_agents: List[str], agent_tools_info: Dict[str, List[str]]):
+    def __init__(self, llm_client: LLMClient, available_agents: List[str], agent_tools_info: Dict[str, List[str]]):
         """
         Args:
-            aoai_wrapper: Azure OpenAI 래퍼
+            llm_client: LLM 클라이언트
             available_agents: 사용 가능한 에이전트 목록 (예: ["mcp1", "mcp2", "mcp3"])
             agent_tools_info: 각 에이전트의 도구 정보 {"mcp1": ["tool1", "tool2"], ...}
         """
@@ -274,14 +588,14 @@ class QuestionUnderstandingAgent(SpecializedAgent):
             name="QuestionUnderstandingAgent",
             role="질문 이해 및 라우팅",
             system_prompt=system_prompt,
-            aoai_wrapper=aoai_wrapper
+            llm_client=llm_client
         )
 
 
 class ToolBasedAgent(SpecializedAgent):
     """도구 기반 전문 에이전트 (범용)"""
 
-    def __init__(self, name: str, role: str, aoai_wrapper: AzureOpenAIWrapper, tools: List[BaseTool]):
+    def __init__(self, name: str, role: str, llm_client: LLMClient, tools: List[BaseTool]):
         system_prompt = f"""당신은 {role} 전문가입니다.
 사용자의 질문에 대해 정확하고 전문적인 답변을 제공합니다.
 필요시 제공된 도구를 사용하여 정보를 검색할 수 있습니다.
@@ -291,7 +605,7 @@ class ToolBasedAgent(SpecializedAgent):
             name=name,
             role=role,
             system_prompt=system_prompt,
-            aoai_wrapper=aoai_wrapper
+            llm_client=llm_client
         )
         self.tools = tools
 
@@ -323,7 +637,7 @@ class ToolBasedAgent(SpecializedAgent):
         max_iterations = 10
         for iteration in range(max_iterations):
             try:
-                response = self.aoai_wrapper.chat_completion(messages, tools=tools_for_openai, stream=False)
+                response = self.llm_client.chat_completion(messages, tools=tools_for_openai, stream=False)
                 choice = response.choices[0].message
 
                 if not getattr(choice, "tool_calls", None):
@@ -399,7 +713,7 @@ class MultiAgentOrchestrator:
     def __init__(self):
         self.servers: Dict[str, MCPServerConnection] = {}
         self.all_tools: List[BaseTool] = []
-        self.aoai_wrapper: Optional[AzureOpenAIWrapper] = None
+        self.llm_client: Optional[LLMClient] = None
 
         self.question_agent: Optional[QuestionUnderstandingAgent] = None
         self.specialist_agents: Dict[str, ToolBasedAgent] = {}  # MCP 서버별 에이전트
@@ -462,12 +776,56 @@ class MultiAgentOrchestrator:
 
     def initialize_agents(self):
         """개별 특화 에이전트들을 동적으로 초기화"""
-        self.aoai_wrapper = AzureOpenAIWrapper(
-            api_key=os.environ["AZURE_OPENAI_API_KEY"],
-            api_version=os.environ["AZURE_OPENAI_API_VERSION"],
-            azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-            deployment=os.environ["AZURE_OPENAI_DEPLOYMENT"],
-        )
+
+        # LLM 제공자 선택 (환경변수에서 읽기, 기본값: azure)
+        llm_provider = os.environ.get("LLM_PROVIDER", "azure").lower()
+
+        # LLM 클라이언트 초기화
+        if llm_provider == "azure":
+            self.llm_client = LLMClient(
+                provider="azure",
+                api_key=os.environ["AZURE_OPENAI_API_KEY"],
+                api_version=os.environ["AZURE_OPENAI_API_VERSION"],
+                azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+                deployment=os.environ["AZURE_OPENAI_DEPLOYMENT"],
+            )
+        elif llm_provider == "openai":
+            self.llm_client = LLMClient(
+                provider="openai",
+                api_key=os.environ.get("OPENAI_API_KEY"),
+                base_url=os.environ.get("OPENAI_BASE_URL"),  # 선택적
+                model=os.environ.get("OPENAI_MODEL", "gpt-4"),
+            )
+        elif llm_provider == "vllm":
+            self.llm_client = LLMClient(
+                provider="vllm",
+                api_key=os.environ.get("VLLM_API_KEY", "EMPTY"),
+                base_url=os.environ["VLLM_BASE_URL"],
+                model=os.environ.get("VLLM_MODEL", "meta-llama/Llama-2-7b-chat-hf"),
+            )
+        elif llm_provider == "google":
+            self.llm_client = LLMClient(
+                provider="google",
+                api_key=os.environ.get("GEMINI_API_KEY"),
+                base_url=os.environ.get("GEMINI_BASE_URL"),  # OpenAI 호환 모드용
+                model=os.environ.get("GEMINI_MODEL", "gemini-1.5-pro"),
+            )
+        elif llm_provider == "anthropic":
+            self.llm_client = LLMClient(
+                provider="anthropic",
+                api_key=os.environ.get("ANTHROPIC_API_KEY"),
+                base_url=os.environ.get("ANTHROPIC_BASE_URL"),  # OpenAI 호환 모드용
+                model=os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
+            )
+        elif llm_provider == "xai":
+            self.llm_client = LLMClient(
+                provider="xai",
+                api_key=os.environ.get("XAI_API_KEY"),
+                base_url=os.environ.get("XAI_BASE_URL"),
+                model=os.environ.get("XAI_MODEL", "grok-beta"),
+            )
+        else:
+            raise ValueError(f"Unsupported LLM_PROVIDER: {llm_provider}. Use 'azure', 'openai', 'vllm', 'google', 'anthropic', or 'xai'")
 
         # 각 서버별 도구 정보 수집
         agent_tools_info = {}
@@ -478,7 +836,7 @@ class MultiAgentOrchestrator:
 
         # Agent A 초기화 (라우팅 에이전트) - 도구 정보 포함
         available_agents = list(self.servers.keys())
-        self.question_agent = QuestionUnderstandingAgent(self.aoai_wrapper, available_agents, agent_tools_info)
+        self.question_agent = QuestionUnderstandingAgent(self.llm_client, available_agents, agent_tools_info)
 
         # 각 MCP 서버별로 에이전트 자동 생성
         print(f"\n✅ 에이전트 초기화 완료:")
@@ -492,7 +850,7 @@ class MultiAgentOrchestrator:
             agent = ToolBasedAgent(
                 name=f"{server_name.upper()}Agent",
                 role=f"{server_name} 전문 서비스",
-                aoai_wrapper=self.aoai_wrapper,
+                llm_client=self.llm_client,
                 tools=server_tools
             )
             self.specialist_agents[server_name] = agent
@@ -645,7 +1003,7 @@ async def run_multi_agent_conversation(orchestrator: MultiAgentOrchestrator, use
             ]
 
             stream_start = time.time()
-            stream_response = orchestrator.aoai_wrapper.chat_completion(messages, stream=True)
+            stream_response = orchestrator.llm_client.chat_completion(messages, stream=True)
 
             collected_content = ""
             for chunk in stream_response:
@@ -810,7 +1168,7 @@ async def run_multi_agent_conversation(orchestrator: MultiAgentOrchestrator, use
         ]
 
         stream_start = time.time()
-        stream_response = orchestrator.aoai_wrapper.chat_completion(messages, stream=True)
+        stream_response = orchestrator.llm_client.chat_completion(messages, stream=True)
 
         collected_content = ""
         for chunk in stream_response:
