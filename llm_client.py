@@ -3,7 +3,7 @@
 LLM Client Module
 범용 LLM 클라이언트 - Azure OpenAI, OpenAI, vLLM, Google Gemini, Anthropic Claude, xAI Grok 지원
 """
-
+import os
 from typing import Any, Dict, List, Optional
 from openai import AzureOpenAI, OpenAI, BadRequestError
 
