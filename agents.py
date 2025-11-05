@@ -4,6 +4,7 @@ Agent Classes Module
 다양한 에이전트 클래스 정의
 """
 
+import os
 import json
 from typing import Any, Dict, List, Optional
 
@@ -160,9 +161,10 @@ class QuestionUnderstandingAgent(SpecializedAgent):
 
 
 class ToolBasedAgent(SpecializedAgent):
-    """도구 기반 전문 에이전트"""
+    """도구 기반 전문 에이전트 (A2A Phase 2 지원)"""
 
-    def __init__(self, name: str, role: str, llm_client: LLMClient, tools: List[BaseTool]):
+    def __init__(self, name: str, role: str, llm_client: LLMClient, tools: List[BaseTool],
+                 description: str = "", orchestrator=None):
         # 도구 정보 수집
         tools_info = []
         for tool in tools:
@@ -178,18 +180,28 @@ class ToolBasedAgent(SpecializedAgent):
 
         system_prompt = f"""당신은 {role} 전문가입니다.
 
+**역할:** {description}
+
+**A2A Phase 2: 에이전트 간 협력**
+당신은 자율적으로 다음을 결정할 수 있습니다:
+1. **도구 사용**: 자신이 가진 도구를 사용하여 직접 작업 수행
+2. **에이전트 협력**: 다른 에이전트의 도움이 필요하면 request_agent_help 도구를 사용
+
 **중요: 도구 사용 시 반드시 아래의 정확한 파라미터 이름을 사용하세요!**
 
 사용 가능한 도구: {len(tools)}개
 {tools_detail}
 (*표시는 필수 파라미터)
 
-**도구 파라미터 규칙:**
-1. 스키마에 정의된 **정확한 파라미터 이름** 사용
-2. 'keyword' 대신 'query', 'search_text' 등 실제 정의된 이름 사용
-3. 필수 파라미터(*)는 반드시 포함
+**협력 원칙:**
+- 자신의 전문 영역 내 작업은 자신의 도구로 해결
+- 다른 전문 영역의 작업이 필요하면 다른 에이전트에게 협력 요청
+- request_agent_help 도구를 사용하여 다른 에이전트에게 작업 위임
 
-필요시 제공된 도구를 사용하여 정보를 검색할 수 있습니다."""
+**도구 파라미터 규칙:**
+1. 도구 호출 시 스키마에 정의된 **정확한 파라미터 이름**을 사용하세요
+2. 'keyword' 대신 'query', 'search_text' 등 실제 정의된 이름 사용
+3. 필수 파라미터(*)는 반드시 포함"""
 
         super().__init__(
             name=name,
@@ -198,9 +210,15 @@ class ToolBasedAgent(SpecializedAgent):
             llm_client=llm_client
         )
         self.tools = tools
+        self.description = description
+        self.orchestrator = orchestrator  # A2A Phase 2를 위한 오케스트레이터 참조
+
+    def set_orchestrator(self, orchestrator):
+        """오케스트레이터 설정 (A2A Phase 2)"""
+        self.orchestrator = orchestrator
 
     async def process_with_tools(self, user_input: str, context: Optional[Dict[str, Any]] = None):
-        """도구를 사용하여 처리"""
+        """도구를 사용하여 처리 (A2A Phase 2: 에이전트 간 협력 지원)"""
         tools_for_openai = []
 
         print(f"\n  📋 [{self.name}] 사용 가능한 도구 Schema:", flush=True)
@@ -210,20 +228,6 @@ class ToolBasedAgent(SpecializedAgent):
             tool_description = getattr(tool, 'description', '')
             tool_input_schema = getattr(tool, 'input_schema', None) or {"type": "object", "properties": {}}
 
-            # # Schema 상세 출력
-            # print(f"    • {tool_name}:", flush=True)
-            # print(f"      설명: {tool_description}", flush=True)
-            # if tool_input_schema and 'properties' in tool_input_schema:
-            #     print(f"      파라미터:", flush=True)
-            #     for param_name, param_info in tool_input_schema['properties'].items():
-            #         param_type = param_info.get('type', 'unknown')
-            #         param_desc = param_info.get('description', '')
-            #         param_enum = param_info.get('enum', None)
-            #         required = param_name in tool_input_schema.get('required', [])
-            #         req_str = " (필수)" if required else " (선택)"
-            #         enum_str = f" enum={param_enum}" if param_enum else ""
-            #         print(f"        - {param_name}: {param_type}{enum_str}{req_str} - {param_desc}", flush=True)
-
             tools_for_openai.append({
                 "type": "function",
                 "function": {
@@ -232,6 +236,57 @@ class ToolBasedAgent(SpecializedAgent):
                     "parameters": tool_input_schema,
                 },
             })
+        
+        # 🤝 A2A Phase 2: 다른 에이전트 협력 요청 도구 추가
+        if self.orchestrator:
+            available_agents = [name for name in self.orchestrator.specialist_agents.keys()
+                              if name != self.name.replace("Agent", "").lower()]
+            
+            if available_agents:
+                # 각 에이전트의 설명 수집
+                agents_info = []
+                for agent_name in available_agents:
+                    agent = self.orchestrator.specialist_agents.get(agent_name)
+                    if agent and hasattr(agent, 'description'):
+                        agents_info.append(f"  - {agent_name}: {agent.description}")
+                
+                agents_info_str = "\n".join(agents_info) if agents_info else "\n".join([f"  - {name}" for name in available_agents])
+                
+                # 에이전트 협력 요청 도구 추가
+                tools_for_openai.append({
+                    "type": "function",
+                    "function": {
+                        "name": "request_agent_help",
+                        "description": f"""다른 전문 에이전트에게 협력을 요청합니다.
+자신의 전문 영역이 아닌 작업이 필요할 때 사용하세요.
+
+사용 가능한 에이전트:
+{agents_info_str}
+
+예시: 법률 에이전트가 최신 뉴스를 검색해야 할 때 search 에이전트에게 요청""",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "target_agent": {
+                                    "type": "string",
+                                    "enum": available_agents,
+                                    "description": "협력을 요청할 에이전트 이름"
+                                },
+                                "task": {
+                                    "type": "string",
+                                    "description": "요청할 작업 내용 (구체적으로)"
+                                },
+                                "reason": {
+                                    "type": "string",
+                                    "description": "협력이 필요한 이유"
+                                }
+                            },
+                            "required": ["target_agent", "task"]
+                        },
+                    },
+                })
+                print(f"    🤝 A2A Phase 2: request_agent_help 도구 활성화", flush=True)
+                print(f"       협력 가능 에이전트: {', '.join(available_agents)}", flush=True)
 
         print(f"", flush=True)
 
@@ -306,6 +361,49 @@ class ToolBasedAgent(SpecializedAgent):
                         print(f"{args_str}", flush=True)
                     except:
                         print(f"      {args}", flush=True)
+
+                    # 🤝 A2A Phase 2: request_agent_help 처리
+                    if tool_name == "request_agent_help":
+                        target_agent_name = args.get("target_agent", "")
+                        task = args.get("task", "")
+                        reason = args.get("reason", "")
+                        
+                        print(f"    🤝 [{self.name}] → [{target_agent_name}] 협력 요청", flush=True)
+                        print(f"       작업: {task}", flush=True)
+                        if reason:
+                            print(f"       이유: {reason}", flush=True)
+                        
+                        if self.orchestrator and target_agent_name in self.orchestrator.specialist_agents:
+                            target_agent = self.orchestrator.specialist_agents[target_agent_name]
+                            try:
+                                # 다른 에이전트에게 작업 위임
+                                agent_response = await target_agent.process_with_tools(task, context)
+                                
+                                if agent_response.success:
+                                    tool_results.append({
+                                        "tool_call_id": tc.id,
+                                        "content": f"[{target_agent_name} 에이전트 응답]\n{agent_response.content}",
+                                    })
+                                    print(f"    ✅ [{target_agent_name}] 협력 완료", flush=True)
+                                else:
+                                    tool_results.append({
+                                        "tool_call_id": tc.id,
+                                        "content": f"Error: {target_agent_name} 에이전트 협력 실패 - {agent_response.content}",
+                                    })
+                                    print(f"    ❌ [{target_agent_name}] 협력 실패", flush=True)
+                            except Exception as e:
+                                tool_results.append({
+                                    "tool_call_id": tc.id,
+                                    "content": f"Error: 협력 요청 실패 - {str(e)}",
+                                })
+                                print(f"    ❌ 협력 요청 실패: {str(e)}", flush=True)
+                        else:
+                            tool_results.append({
+                                "tool_call_id": tc.id,
+                                "content": f"Error: Agent '{target_agent_name}' not found",
+                            })
+                            print(f"    ⚠️  Agent '{target_agent_name}' not found", flush=True)
+                        continue
 
                     tool_found = False
                     for tool in self.tools:

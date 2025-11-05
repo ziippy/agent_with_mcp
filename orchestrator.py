@@ -105,8 +105,8 @@ class MultiAgentOrchestrator:
             self.llm_client, available_agents, agent_descriptions
         )
 
-        # 전문 에이전트 생성
-        print(f"\n✅ 에이전트 초기화 완료 (A2A 1단계):")
+        # 전문 에이전트 생성 (A2A Phase 2)
+        print(f"\n✅ 에이전트 초기화 완료 (A2A Phase 2):")
         print(f"   • {self.question_agent.name}: {self.question_agent.role}")
 
         for server_name in self.mcp_manager.servers.keys():
@@ -117,10 +117,14 @@ class MultiAgentOrchestrator:
                 name=f"{server_name.upper()}Agent",
                 role=f"{server_name} 전문 서비스",
                 llm_client=self.llm_client,
-                tools=server_tools
+                tools=server_tools,
+                description=agent_descriptions.get(server_name, ""),
+                orchestrator=self  # A2A Phase 2: 오케스트레이터 참조 전달
             )
             self.specialist_agents[server_name] = agent
             print(f"   • {agent.name}: {agent.role} (도구 {len(server_tools)}개)")
+
+        print(f"   🤝 A2A Phase 2 활성화: 에이전트 간 Peer-to-Peer 협력 가능")
 
     def _generate_agent_description(self, server_name: str, server_tools) -> str:
         """도구들의 description을 기반으로 에이전트 설명 자동 생성 (A2A 1단계)"""
