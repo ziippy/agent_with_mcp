@@ -42,18 +42,10 @@ class LLMClient:
     ):
         """
         LLM 클라이언트 초기화
-
-        Args:
-            provider: LLM 제공자 ("azure", "openai", "vllm", "google", "anthropic", "xai")
-            api_key: API 키
-            base_url: 기본 URL (OpenAI, vLLM, Google, Anthropic, xAI용)
-            model: 모델 이름 (OpenAI, vLLM, Google, Anthropic, xAI용)
-            api_version: API 버전 (Azure OpenAI용)
-            azure_endpoint: Azure 엔드포인트 (Azure OpenAI용)
-            deployment: 배포 이름 (Azure OpenAI용)
         """
         self.provider = provider.lower()
         self.model = model or deployment
+        self.max_retries = int(os.environ.get("LLM_MAX_RETRIES", 3))
 
         try:
             if self.provider == "azure":
@@ -61,6 +53,7 @@ class LLMClient:
                     api_key=api_key,
                     api_version=api_version,
                     azure_endpoint=azure_endpoint,
+                    max_retries=self.max_retries,
                 )
                 self.model = deployment
                 print(f"[LLM] Azure OpenAI initialized (deployment: {deployment})")
@@ -69,6 +62,7 @@ class LLMClient:
                 # OpenAI 초기화 - base_url이 없으면 기본값 사용
                 init_kwargs = {
                     "api_key": api_key,
+                    "max_retries": self.max_retries,
                 }
                 if base_url:  # base_url이 있을 때만 전달
                     init_kwargs["base_url"] = base_url
@@ -112,7 +106,8 @@ class LLMClient:
                     http_client=http_client,
                     default_headers={
                         "Content-Type": "application/json; charset=utf-8"
-                    }
+                    },
+                    max_retries=self.max_retries,
                 )
 
                 # OpenAI 클라이언트 내부의 JSON serialization을 패치
@@ -185,6 +180,7 @@ class LLMClient:
                 self.client = OpenAI(
                     api_key=api_key,
                     base_url=base_url or "https://api.x.ai/v1",
+                    max_retries=self.max_retries,
                 )
                 self.model = model or "grok-beta"
                 print(f"[LLM] xAI Grok initialized")

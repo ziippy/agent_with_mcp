@@ -25,10 +25,18 @@ async def initialize_multi_agent() -> MultiAgentOrchestrator:
             url_key = f"MCP_SERVER_{server_index}_URL"
             bearer_key = f"MCP_SERVER_{server_index}_AUTH_BEARER"
             name_key = f"MCP_SERVER_{server_index}_NAME"
+            enabled_key = f"MCP_SERVER_{server_index}_ENABLED"
 
             server_url = os.environ.get(url_key, "")
             if not server_url:
                 break
+
+            # ENABLED 플래그 확인 (기본값: true)
+            is_enabled = os.environ.get(enabled_key, "true").lower() in ("true", "1", "yes")
+            if not is_enabled:
+                print(f"MCP Server '{os.environ.get(name_key, f'mcp{server_index}')}' is disabled. Skipping.")
+                server_index += 1
+                continue
 
             server_bearer = os.environ.get(bearer_key, "")
             server_name = os.environ.get(name_key, f"mcp{server_index}")

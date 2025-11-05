@@ -278,7 +278,7 @@ class ToolBasedAgent(SpecializedAgent):
             {"role": "user", "content": enhanced_input}
         ]
 
-        max_iterations = 10
+        max_iterations = int(os.environ.get("MAX_ITERATIONS", 10))
         for iteration in range(max_iterations):
             try:
                 response = self.llm_client.chat_completion(messages, tools=tools_for_openai, stream=False)
