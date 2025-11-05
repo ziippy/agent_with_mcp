@@ -80,23 +80,33 @@ class MultiAgentOrchestrator:
         else:
             raise ValueError(f"Unsupported LLM_PROVIDER: {llm_provider}")
 
-        # 각 서버별 도구 정보 수집
-        agent_tools_info = {}
+        # A2A 1단계: 각 서버별 에이전트 description 생성
+        agent_descriptions = {}
         for server_name in self.mcp_manager.servers.keys():
             server_tools = [tool for tool in self.mcp_manager.all_tools
                           if getattr(tool, 'name', '').startswith(f'{server_name}__')]
-            tool_names = [getattr(tool, 'name', '').replace(f'{server_name}__', '')
-                         for tool in server_tools]
-            agent_tools_info[server_name] = tool_names
 
-        # Agent A 초기화
+            # .env에서 description이 있으면 사용
+            description_key = f"MCP_SERVER_{list(self.mcp_manager.servers.keys()).index(server_name) + 1}_DESCRIPTION"
+            env_description = os.environ.get(description_key, "")
+
+            if env_description:
+                description = env_description
+            else:
+                # 도구 이름에서 자동 생성
+                description = self._generate_agent_description(server_name, server_tools)
+
+            agent_descriptions[server_name] = description
+            print(f"[INFO] {server_name} description: {description}")
+
+        # Agent A 초기화 (A2A 1단계: description 기반)
         available_agents = list(self.mcp_manager.servers.keys())
         self.question_agent = QuestionUnderstandingAgent(
-            self.llm_client, available_agents, agent_tools_info
+            self.llm_client, available_agents, agent_descriptions
         )
 
         # 전문 에이전트 생성
-        print(f"\n✅ 에이전트 초기화 완료:")
+        print(f"\n✅ 에이전트 초기화 완료 (A2A 1단계):")
         print(f"   • {self.question_agent.name}: {self.question_agent.role}")
 
         for server_name in self.mcp_manager.servers.keys():
@@ -111,6 +121,44 @@ class MultiAgentOrchestrator:
             )
             self.specialist_agents[server_name] = agent
             print(f"   • {agent.name}: {agent.role} (도구 {len(server_tools)}개)")
+
+    def _generate_agent_description(self, server_name: str, server_tools) -> str:
+        """도구들의 description을 기반으로 에이전트 설명 자동 생성 (A2A 1단계)"""
+        if not server_tools:
+            return f"{server_name} 도메인 전문 에이전트"
+
+        # 각 도구의 description 수집
+        tool_descriptions = []
+        for tool in server_tools:
+            tool_desc = getattr(tool, 'description', '')
+            if tool_desc:
+                # description이 너무 길면 첫 문장만 사용
+                first_sentence = tool_desc.split('.')[0].strip()
+                if first_sentence:
+                    tool_descriptions.append(first_sentence)
+
+        if not tool_descriptions:
+            # description이 없으면 도구 이름 나열
+            tool_names = [getattr(tool, 'name', '').replace(f'{server_name}__', '')
+                         for tool in server_tools]
+            tool_list = ', '.join(tool_names[:3])
+            if len(tool_names) > 3:
+                tool_list += f" 등 {len(tool_names)}개 도구"
+            return f"{server_name} 전문 에이전트 ({tool_list}를 제공)"
+
+        # 도구 description들을 통합
+        if len(tool_descriptions) == 1:
+            # 도구가 1개면 그대로 사용
+            return f"{server_name} 전문 에이전트. {tool_descriptions[0]}을(를) 지원합니다."
+        elif len(tool_descriptions) <= 3:
+            # 도구가 2-3개면 모두 나열
+            combined = ", ".join(tool_descriptions[:-1]) + f" 및 {tool_descriptions[-1]}"
+            return f"{server_name} 전문 에이전트. {combined} 기능을 제공합니다."
+        else:
+            # 도구가 4개 이상이면 처음 3개만 + 개수
+            combined = ", ".join(tool_descriptions[:3])
+            remaining = len(tool_descriptions) - 3
+            return f"{server_name} 전문 에이전트. {combined} 등 {len(tool_descriptions)}개 기능을 제공합니다."
 
     async def close_all_servers(self):
         """모든 MCP 서버 연결 종료"""
@@ -152,6 +200,31 @@ async def run_multi_agent_conversation(orchestrator: MultiAgentOrchestrator, use
         question_type = analysis.get("question_type", "general")
         queries = analysis.get("queries", {})
         dependencies = analysis.get("dependencies", {})
+
+        # 🔍 일관성 검증: execution_order와 question_type이 맞지 않으면 자동 수정
+        if execution_order:
+            # execution_order 구조 확인
+            is_parallel = len(execution_order) == 1 and len(execution_order[0]) > 1
+            is_sequential = len(execution_order) > 1
+
+            # dependencies가 있으면 순차 실행이어야 함
+            if dependencies and is_parallel:
+                print(f"⚠️  일관성 오류 감지: dependencies가 있는데 parallel로 판단됨", flush=True)
+                print(f"   자동 수정: parallel → sequential", flush=True)
+                # 병렬을 순차로 변경
+                if len(execution_order[0]) > 1:
+                    execution_order = [[agent] for agent in execution_order[0]]
+                    question_type = "sequential"
+
+            # execution_order와 question_type 일치 여부 확인
+            if is_parallel and question_type != "parallel":
+                print(f"⚠️  일관성 오류 감지: execution_order는 parallel인데 question_type={question_type}", flush=True)
+                print(f"   자동 수정: question_type → parallel", flush=True)
+                question_type = "parallel"
+            elif is_sequential and question_type == "parallel":
+                print(f"⚠️  일관성 오류 감지: execution_order는 sequential인데 question_type=parallel", flush=True)
+                print(f"   자동 수정: question_type → sequential", flush=True)
+                question_type = "sequential"
 
         print(f"🎯 판단 결과:")
         print(f"   질문 유형: {question_type}")
