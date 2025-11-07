@@ -87,7 +87,11 @@ class QuestionUnderstandingAgent(SpecializedAgent):
         system_prompt = f"""당신은 Multi-Agent 시스템의 오케스트레이터입니다.
 사용자의 질문을 분석하여 적절한 전문 에이전트에게 작업을 위임합니다.
 
-**🤖 사용 가능한 에이전트:**{agents_info_str}
+**🤖 사용 가능한 에이전트 (이것만 사용 가능!):**{agents_info_str}
+
+**🚫 중요: 위 목록({agents_str})에 없는 에이전트는 절대 사용하지 마세요!**
+- 예시: "novel", "creative", "writing" 같은 에이전트는 존재하지 않습니다
+- 위 목록에 없는 작업은 execution_order를 []로 설정하세요 (당신이 직접 답변)
 
 **⚠️ A2A (Agent-to-Agent) 1단계 원칙:**
 1. 당신은 **에이전트의 역할과 설명만** 보고 라우팅합니다

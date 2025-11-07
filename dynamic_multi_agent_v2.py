@@ -51,8 +51,8 @@ async def initialize_multi_agent() -> MultiAgentOrchestrator:
 
             server_index += 1
 
-        if not connected_servers:
-            raise RuntimeError("No MCP servers connected. Check your .env configuration.")
+        # if not connected_servers:
+        #     raise RuntimeError("No MCP servers connected. Check your .env configuration.")
 
         print(f"\n✅ Connected to {len(connected_servers)} MCP server(s): {', '.join(connected_servers)}")
         print("\nInitializing Multi-Agent System...")
@@ -111,4 +111,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

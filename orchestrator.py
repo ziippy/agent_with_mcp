@@ -226,6 +226,21 @@ async def run_multi_agent_conversation(orchestrator: MultiAgentOrchestrator, use
                 print(f"   자동 수정: question_type → sequential", flush=True)
                 question_type = "sequential"
 
+        # 🔍 존재하지 않는 에이전트 검증
+        available_agents = set(orchestrator.specialist_agents.keys())
+        invalid_agents = []
+
+        if execution_order:
+            # 모든 에이전트 이름 추출
+            all_requested_agents = [agent for group in execution_order for agent in group]
+            invalid_agents = [agent for agent in all_requested_agents if agent not in available_agents]
+
+            if invalid_agents:
+                print(f"⚠️  존재하지 않는 에이전트 감지: {', '.join(invalid_agents)}")
+                print(f"   사용 가능한 에이전트: {', '.join(available_agents)}")
+                print(f"   → 일반 질문으로 전환하여 Agent A가 직접 답변합니다.\n")
+                execution_order = []  # 일반 질문으로 전환
+
         print(f"🎯 판단 결과:")
         print(f"   질문 유형: {question_type}")
 
