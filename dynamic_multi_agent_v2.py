@@ -26,6 +26,8 @@ async def initialize_multi_agent() -> MultiAgentOrchestrator:
             bearer_key = f"MCP_SERVER_{server_index}_AUTH_BEARER"
             name_key = f"MCP_SERVER_{server_index}_NAME"
             enabled_key = f"MCP_SERVER_{server_index}_ENABLED"
+            tenant_uuid_key = f"MCP_SERVER_{server_index}_TENANT_UUID"
+            account_id_key = f"MCP_SERVER_{server_index}_ACCOUNT_ID"
 
             server_url = os.environ.get(url_key, "")
             if not server_url:
@@ -40,10 +42,14 @@ async def initialize_multi_agent() -> MultiAgentOrchestrator:
 
             server_bearer = os.environ.get(bearer_key, "")
             server_name = os.environ.get(name_key, f"mcp{server_index}")
+            tenant_uuid = os.environ.get(tenant_uuid_key, "")
+            account_id = os.environ.get(account_id_key, "")
 
             print(f"Connecting to MCP Server '{server_name}': {server_url}")
             try:
-                await orchestrator.connect_mcp_server(server_name, server_url, server_bearer)
+                await orchestrator.connect_mcp_server(
+                    server_name, server_url, server_bearer, tenant_uuid, account_id
+                )
                 print(f"✓ Connected to {server_name}")
                 connected_servers.append(server_name)
             except Exception as e:

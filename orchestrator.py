@@ -24,9 +24,10 @@ class MultiAgentOrchestrator:
         self.question_agent: Optional[QuestionUnderstandingAgent] = None
         self.specialist_agents = {}
 
-    async def connect_mcp_server(self, server_name: str, base_url: str, auth_bearer: str = ""):
+    async def connect_mcp_server(self, server_name: str, base_url: str, auth_bearer: str = "",
+                                 tenant_uuid: str = "", account_id: str = ""):
         """MCP 서버 연결"""
-        return await self.mcp_manager.connect_mcp_server(server_name, base_url, auth_bearer)
+        return await self.mcp_manager.connect_mcp_server(server_name, base_url, auth_bearer, tenant_uuid, account_id)
 
     def initialize_agents(self):
         """에이전트 초기화"""

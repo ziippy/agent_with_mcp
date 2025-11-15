@@ -51,12 +51,21 @@ class MCPManager:
 
         return wrapped
 
-    async def connect_mcp_server(self, server_name: str, base_url: str, auth_bearer: str = "") -> MCPServerConnection:
+    async def connect_mcp_server(self, server_name: str, base_url: str, auth_bearer: str = "",
+                                 tenant_uuid: str = "", account_id: str = "") -> MCPServerConnection:
         """MCP 서버 연결"""
         base_url = self._normalize_url(base_url)
         headers = {}
+
+        # Authorization 헤더
         if auth_bearer:
             headers["Authorization"] = f"Bearer {auth_bearer}"
+
+        # 커스텀 헤더 추가
+        if tenant_uuid:
+            headers["X-Tenant-UUID"] = tenant_uuid
+        if account_id:
+            headers["X-Account-ID"] = account_id
 
         try:
             conn_params = StreamableHTTPConnectionParams(
@@ -70,6 +79,8 @@ class MCPManager:
 
             # 디버깅: 도구 schema 확인
             print(f"\n🔍 [{server_name}] 도구 Schema 디버깅:", flush=True)
+            if headers:
+                print(f"   📤 전송 헤더: {', '.join([k for k in headers.keys()])}", flush=True)
             for tool in tools:
                 tool_name = getattr(tool, 'name', type(tool).__name__)
                 tool_input_schema = getattr(tool, 'input_schema', None)
